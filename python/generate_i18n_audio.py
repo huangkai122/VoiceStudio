@@ -5,7 +5,7 @@
 - 扫描 pt_language_registry 中 enabled=1 且 voice_enabled=1 的语言；
 - 对 pt_landmark_detail{table_suffix} 中 audio_text 非空、audio_url / audio_url_man
   为空的记录，分别用 registry.voice / registry.man_voice 调 VoiceStudio TTS 合成；
-- 英文在 Python 内完成混元读音预分析、专名编译、VoiceStudio TTS、独立 ASR 回检和上传；
+- 非中文稿件按文本完成混元读音预分析后立即合成；英文支持专名编译和可选 ASR 回检；
 - 非中文合成结果经合作方 API（spotId=中文源景点 id，voiceIndex 区分男女声）落盘；
   中文仍走原内部上传接口，
   用返回的 data.path 回写 audio_url / audio_url_man；
@@ -1636,60 +1636,25 @@ def run(args: argparse.Namespace) -> int:
                         else:
                             LOG.info("lang=%s spot=%s 男声音色创建失败，跳过男声", language["lang_code"], row["spot_id"])
 
-            plan_inputs: dict[tuple[str, str], list[tuple[dict[str, Any], dict[str, Any]]]] = {}
-            for language, row, _, _, _ in tasks:
-                language_code = normalize_language_code(str(language["lang_code"]))
-                if is_chinese_language(language_code):
-                    continue
-                narration_text = str(row["audio_text"])
-                plan_inputs.setdefault((language_code, narration_text), []).append((language, row))
+            task_groups: dict[tuple[str, str], list[tuple[dict[str, Any], dict[str, Any], str, str, str | None]]] = {}
+            for task in tasks:
+                language, row, _, _, _ = task
+                key = (normalize_language_code(str(language["lang_code"])), str(row["audio_text"]))
+                task_groups.setdefault(key, []).append(task)
 
             pronunciation_plans: dict[tuple[str, str], PronunciationPlan] = {}
             plan_errors: dict[tuple[str, str], Exception] = {}
-            if plan_inputs:
+            needs_pronunciation_planner = any(
+                not is_chinese_language(key[0]) for key in task_groups
+            )
+            pronunciation_planner = None
+            planner_init_error: Exception | None = None
+            if needs_pronunciation_planner:
                 try:
                     pronunciation_planner = HunyuanPronunciationPlanner()
                 except Exception as exc:  # noqa: BLE001
-                    for key in plan_inputs:
-                        plan_errors[key] = exc
+                    planner_init_error = exc
                     LOG.error("读音预分析配置失败，相关语音将跳过合成：%s", exc)
-                else:
-                    def create_plan(key: tuple[str, str]) -> PronunciationPlan:
-                        return pronunciation_planner.create_plan(key[1], key[0])
-
-                    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-                        futures = {pool.submit(create_plan, key): key for key in plan_inputs}
-                        for future in as_completed(futures):
-                            key = futures[future]
-                            language, row = plan_inputs[key][0]
-                            try:
-                                pronunciation_plan = future.result()
-                                pronunciation_plans[key] = pronunciation_plan
-                                if pronunciation_plan:
-                                    LOG.info(
-                                        "读音预分析规划 lang=%s spot=%s: %s",
-                                        language["lang_code"], row["spot_id"], pronunciation_plan,
-                                    )
-                                else:
-                                    LOG.info(
-                                        "读音预分析完成，未发现额外风险 lang=%s spot=%s",
-                                        language["lang_code"], row["spot_id"],
-                                    )
-                            except Exception as exc:  # noqa: BLE001
-                                if (args.fallback_pronunciation_plan_on_429
-                                        and normalize_language_code(key[0]).split("-", 1)[0] == "en"
-                                        and _is_hunyuan_rate_limit_error(exc)):
-                                    pronunciation_plans[key] = PronunciationPlan()
-                                    LOG.warning(
-                                        "混元读音预分析遇到 429，改用词典规则继续 lang=%s spot=%s",
-                                        language["lang_code"], row["spot_id"],
-                                    )
-                                else:
-                                    plan_errors[key] = exc
-                                    LOG.error(
-                                        "读音预分析失败 lang=%s spot=%s，跳过该稿的语音生成：%s",
-                                        language["lang_code"], row["spot_id"], exc,
-                                    )
 
             english_tasks = [task for task in tasks
                              if normalize_language_code(str(task[0]["lang_code"])).split("-", 1)[0] == "en"]
@@ -1698,34 +1663,6 @@ def run(args: argparse.Namespace) -> int:
                 LOG.warning("ASR 检测已跳过：英文 TTS 合成后直接上传，不记录 ASR QA 或候选")
             english_dictionary_cache: dict[tuple[str, str], tuple[int, list[EnglishPronunciationTerm]]] = {}
             english_compilations: dict[tuple[str, str, str, str], EnglishTtsCompilation] = {}
-            for language, row, column, voice, _ in english_tasks:
-                cache_key = (tts.model, voice)
-                if cache_key not in english_dictionary_cache:
-                    english_dictionary_cache[cache_key] = load_english_pronunciation_dictionary(
-                        cursor, tts.PROVIDER, tts.model, voice,
-                    )
-                dictionary_version, entries = english_dictionary_cache[cache_key]
-                plan_key = (normalize_language_code(str(language["lang_code"])), str(row["audio_text"]))
-                if plan_key in plan_errors:
-                    continue
-                pronunciation_plan = pronunciation_plans.get(plan_key, PronunciationPlan())
-                planned_text = apply_pronunciation_replacements(
-                    str(row["audio_text"]), list(pronunciation_plan.replacements),
-                )
-                compilation = compile_english_tts_text(
-                    str(row["audio_text"]), tts.PROVIDER, tts.model, voice,
-                    dictionary_version, entries, tts_input_text=planned_text,
-                )
-                task_key = (str(language["lang_code"]), str(row["spot_id"]), column, voice)
-                english_compilations[task_key] = compilation
-                LOG.info(
-                    "英文读音编译 lang=%s spot=%s voice=%s terms=%d warnings=%s dictionary_version=%d",
-                    language["lang_code"], row["spot_id"], voice, len(compilation.terms),
-                    list(compilation.warnings), compilation.dictionary_version,
-                )
-                if args.verbose:
-                    LOG.debug("英文 TTS 专用文本 lang=%s spot=%s: %s",
-                              language["lang_code"], row["spot_id"], compilation.tts_text)
 
             counters = {"success": 0, "failed": sum(item[2] for item in profile_failures)}
             cursor = connection.cursor()
@@ -1733,7 +1670,6 @@ def run(args: argparse.Namespace) -> int:
                 f"lang={lang_code} {voice_field} profile 创建失败，影响 {count} 条：{detail}"
                 for lang_code, voice_field, count, detail in profile_failures
             ]
-
             def do_task(task: tuple[dict[str, Any], dict[str, Any], str, str, str | None]) -> dict[str, Any]:
                 language, row, column, voice, gender = task
                 style_prompt = str(language["voice_style"] or "").strip() or DEFAULT_STYLE_PROMPT
@@ -1814,23 +1750,27 @@ def run(args: argparse.Namespace) -> int:
                 connection.commit()
                 return str(path)
 
-            if args.workers <= 1:
-                for task in tasks:
-                    language, row, column, _, gender = task
-                    try:
-                        generated = do_task(task)
-                        path = persist_result(task, generated)
-                        counters["success"] += 1
-                        LOG.info("lang=%s spot=%s %s(%s) -> %s",
-                                 language["lang_code"], row["spot_id"], column, gender or "woman", path)
-                    except Exception as exc:  # noqa: BLE001 - 单条失败不影响后续
-                        counters["failed"] += 1
-                        failure_samples.append(f"lang={language['lang_code']} spot={row['spot_id']} {column}: {exc}")
-                        LOG.error("生成失败 lang=%s spot=%s %s: %s",
-                                  language["lang_code"], row["spot_id"], column, exc)
-            else:
+            def process_tasks(group_tasks: list[tuple[dict[str, Any], dict[str, Any], str, str, str | None]]) -> None:
+                if args.workers <= 1:
+                    for task in group_tasks:
+                        language, row, column, _, gender = task
+                        try:
+                            generated = do_task(task)
+                            path = persist_result(task, generated)
+                            counters["success"] += 1
+                            LOG.info("lang=%s spot=%s %s(%s) -> %s",
+                                     language["lang_code"], row["spot_id"], column, gender or "woman", path)
+                        except Exception as exc:  # noqa: BLE001 - 单条失败不影响后续
+                            counters["failed"] += 1
+                            failure_samples.append(
+                                f"lang={language['lang_code']} spot={row['spot_id']} {column}: {exc}"
+                            )
+                            LOG.error("生成失败 lang=%s spot=%s %s: %s",
+                                      language["lang_code"], row["spot_id"], column, exc)
+                    return
+
                 with ThreadPoolExecutor(max_workers=args.workers) as pool:
-                    futures = {pool.submit(do_task, task): task for task in tasks}
+                    futures = {pool.submit(do_task, task): task for task in group_tasks}
                     for future in as_completed(futures):
                         task = futures[future]
                         language, row, column, _, gender = task
@@ -1840,12 +1780,87 @@ def run(args: argparse.Namespace) -> int:
                             counters["success"] += 1
                             LOG.info("lang=%s spot=%s %s(%s) -> %s",
                                      language["lang_code"], row["spot_id"], column, gender or "woman", path)
-                        except Exception as exc:  # noqa: BLE001
+                        except Exception as exc:  # noqa: BLE001 - 单条失败不影响后续
                             counters["failed"] += 1
-                            failure_samples.append(f"lang={language['lang_code']} spot={row['spot_id']} {column}: {exc}")
+                            failure_samples.append(
+                                f"lang={language['lang_code']} spot={row['spot_id']} {column}: {exc}"
+                            )
                             LOG.error("生成失败 lang=%s spot=%s %s: %s",
                                       language["lang_code"], row["spot_id"], column, exc)
 
+            # 按语言和文本分组：每稿完成读音规划后立即生成对应音频。
+            for key, group_tasks in task_groups.items():
+                language, row, _, _, _ = group_tasks[0]
+                if not is_chinese_language(key[0]):
+                    if planner_init_error is not None:
+                        plan_errors[key] = planner_init_error
+                    else:
+                        try:
+                            pronunciation_plan = pronunciation_planner.create_plan(key[1], key[0])
+                            pronunciation_plans[key] = pronunciation_plan
+                            if pronunciation_plan:
+                                LOG.info(
+                                    "读音预分析规划 lang=%s spot=%s: %s",
+                                    language["lang_code"], row["spot_id"], pronunciation_plan,
+                                )
+                            else:
+                                LOG.info(
+                                    "读音预分析完成，未发现额外风险 lang=%s spot=%s",
+                                    language["lang_code"], row["spot_id"],
+                                )
+                        except Exception as exc:  # noqa: BLE001
+                            if (args.fallback_pronunciation_plan_on_429
+                                    and key[0].split("-", 1)[0] == "en"
+                                    and _is_hunyuan_rate_limit_error(exc)):
+                                pronunciation_plans[key] = PronunciationPlan()
+                                LOG.warning(
+                                    "混元读音预分析遇到 429，改用词典规则继续 lang=%s spot=%s",
+                                    language["lang_code"], row["spot_id"],
+                                )
+                            else:
+                                plan_errors[key] = exc
+                                LOG.error(
+                                    "读音预分析失败 lang=%s spot=%s，跳过该稿的语音生成：%s",
+                                    language["lang_code"], row["spot_id"], exc,
+                                )
+
+                for task in group_tasks:
+                    task_language, task_row, column, voice, _ = task
+                    if (normalize_language_code(str(task_language["lang_code"])).split("-", 1)[0] != "en"
+                            or key in plan_errors):
+                        continue
+                    cache_key = (tts.model, voice)
+                    if cache_key not in english_dictionary_cache:
+                        english_dictionary_cache[cache_key] = load_english_pronunciation_dictionary(
+                            cursor, tts.PROVIDER, tts.model, voice,
+                        )
+                    dictionary_version, entries = english_dictionary_cache[cache_key]
+                    pronunciation_plan = pronunciation_plans.get(key, PronunciationPlan())
+                    planned_text = apply_pronunciation_replacements(
+                        str(task_row["audio_text"]), list(pronunciation_plan.replacements),
+                    )
+                    compilation = compile_english_tts_text(
+                        str(task_row["audio_text"]), tts.PROVIDER, tts.model, voice,
+                        dictionary_version, entries, tts_input_text=planned_text,
+                    )
+                    task_key = (str(task_language["lang_code"]), str(task_row["spot_id"]), column, voice)
+                    english_compilations[task_key] = compilation
+                    LOG.info(
+                        "英文读音编译 lang=%s spot=%s voice=%s terms=%d warnings=%s dictionary_version=%d",
+                        task_language["lang_code"], task_row["spot_id"], voice, len(compilation.terms),
+                        list(compilation.warnings), compilation.dictionary_version,
+                    )
+                    if args.verbose:
+                        LOG.debug("英文 TTS 专用文本 lang=%s spot=%s: %s",
+                                  task_language["lang_code"], task_row["spot_id"], compilation.tts_text)
+
+                if key in plan_errors:
+                    LOG.info("跳过当前稿件生成 lang=%s spot=%s，读音规划失败",
+                             language["lang_code"], row["spot_id"])
+                else:
+                    LOG.info("开始生成 lang=%s spot=%s 对应音频 %d 条",
+                             language["lang_code"], row["spot_id"], len(group_tasks))
+                process_tasks(group_tasks)
             LOG.info("完成：成功 %d 条，失败 %d 条", counters["success"], counters["failed"])
             for sample in failure_samples[:20]:
                 LOG.error("失败明细: %s", sample)
