@@ -65,4 +65,4 @@ else
 fi
 
 exec "$UV_BIN" run --no-project --default-index https://pypi.org/simple \
-  --with pymysql -- python "$SCRIPT_PATH" --apply
+  --with pymysql -- python "$SCRIPT_PATH" --apply --skip-asr
