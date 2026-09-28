@@ -695,3 +695,8 @@ VoiceStudio 站在这些杰出开源工作的肩膀上：
     </picture>
   </a>
 </div>
+
+
+
+## 启动API服务
+- uv run python backend/main.py
