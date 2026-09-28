@@ -1522,6 +1522,8 @@ def run(args: argparse.Namespace) -> int:
             registry = load_registry(cursor, lang_filter)
             if not registry:
                 LOG.warning("没有可处理的语言（检查 pt_language_registry 的 enabled/voice_enabled）")
+                if args.check_pending:
+                    print("PENDING_AUDIO_COUNT=0")
                 return 0
             plan: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
             for language in registry:
@@ -1544,6 +1546,9 @@ def run(args: argparse.Namespace) -> int:
                 "待处理语言 %d 个，待生成语音 %d 条（dry-run 只列清单，--apply 才执行）",
                 len(plan), total_generate,
             )
+            if args.check_pending:
+                print(f"PENDING_AUDIO_COUNT={total_generate}")
+                return 0
             for language, rows in plan:
                 LOG.info(
                     "语言 %s（%s%s）女声音色=%s 男声音色=%s，待补 %d 条",
@@ -1852,6 +1857,10 @@ def run(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--apply", action="store_true", help="真正合成上传写库（默认 dry-run 只列清单）")
+    parser.add_argument(
+        "--check-pending", action="store_true",
+        help="只查询可生成音频数量并输出数字，不调用 TTS 或修改数据库",
+    )
     parser.add_argument("--lang", help="只处理指定语言，逗号分隔（如 en,ja）；默认全部启用语音的语言")
     parser.add_argument("--limit", type=int, default=0, help="每种语言最多处理 N 条，0 表示不限制")
     parser.add_argument("--workers", type=int, default=1, help="合成上传并发线程数，默认 1（串行）")
@@ -1869,6 +1878,8 @@ def main() -> int:
     )
     parser.add_argument("--verbose", action="store_true", help="输出 DEBUG 日志")
     args = parser.parse_args()
+    if args.check_pending and args.apply:
+        parser.error("--check-pending cannot be combined with --apply")
     return run(args)
 
 
