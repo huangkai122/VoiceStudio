@@ -33,6 +33,7 @@ import logging
 import os
 import re
 import secrets
+import socket
 import threading
 import time
 import urllib.error
@@ -82,6 +83,11 @@ ENGLISH_PRONUNCIATION_REPLACEMENTS = (
 MAX_TTS_CHUNK_LENGTH = 80
 MAX_RETRY_PER_CHUNK = 3
 RETRY_INTERVAL_SECONDS = 2.0
+DATABASE_CONNECTION_ERROR_CODES = {1040, 1045, 1049, 2002, 2003, 2006, 2013, 2014, 2055}
+
+
+class DatabaseConnectionError(RuntimeError):
+    """数据库连接或通信失败，需要单独通知。"""
 
 
 def load_dotenv(path: Path = ENV_FILE) -> bool:
@@ -105,6 +111,84 @@ def load_dotenv(path: Path = ENV_FILE) -> bool:
             value = value[1:-1]
         os.environ.setdefault(key, value)
     return True
+
+
+def _safe_error_summary(exc: BaseException | str) -> str:
+    summary = f"{type(exc).__name__}: {exc}" if isinstance(exc, BaseException) else str(exc)
+    for name in (
+        "PT_DB_PASSWORD", "PT_FEISHU_WEBHOOK_URL", "PT_VOICESTUDIO_API_KEY",
+        "PT_MIMO_ASR_API_KEY", "PT_PRONUNCIATION_PLAN_HUNYUAN_ACCESS_TOKEN",
+        "PT_PARTNER_SECRET_KEY", "PT_UPLOAD_API_KEY",
+    ):
+        secret = os.getenv(name, "")
+        if secret:
+            summary = summary.replace(secret, "[已隐藏]")
+    return summary[:1200]
+
+
+def _current_public_ip() -> str:
+    try:
+        direct_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with direct_opener.open("https://api.ipify.org", timeout=3) as response:
+            return response.read(64).decode("utf-8", errors="replace").strip() or "查询结果为空"
+    except Exception:
+        return "查询失败"
+
+
+def send_feishu_alert(title: str, details: str, include_database_info: bool = False) -> None:
+    """Send one best-effort text notification; never replace the original task error."""
+    try:
+        load_dotenv()
+    except Exception as exc:
+        LOG.warning("读取飞书通知配置失败: %s", _safe_error_summary(exc))
+    webhook_url = os.getenv("PT_FEISHU_WEBHOOK_URL", "").strip()
+    if not webhook_url:
+        LOG.warning("未配置 PT_FEISHU_WEBHOOK_URL，跳过飞书通知: %s", title)
+        return
+
+    lines = [
+        "PictureTrip 多语言语音任务告警",
+        f"类型：{title}",
+        f"时间：{time.strftime('%Y-%m-%d %H:%M:%S %Z')}",
+        f"设备：{socket.gethostname()}",
+    ]
+    if include_database_info:
+        db_host = os.getenv("PT_DB_HOST", "").strip() or "(未配置)"
+        db_port = os.getenv("PT_DB_PORT", "3306").strip() or "3306"
+        lines.extend((f"数据库：{db_host}:{db_port}", f"当前公网 IP：{_current_public_ip()}"))
+    lines.append(f"详情：{details[:5000]}")
+    body = json.dumps(
+        {"msg_type": "text", "content": {"text": "\n".join(lines)}},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        webhook_url,
+        data=body,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace") or "{}")
+        response_code = payload.get("code", payload.get("StatusCode", 0))
+        if response_code not in (0, "0", None):
+            LOG.error("飞书告警发送失败，返回 code=%s", response_code)
+    except Exception as exc:
+        LOG.error("飞书告警发送失败，原任务状态不受影响: %s", _safe_error_summary(exc))
+
+
+def _is_database_connection_error(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, DatabaseConnectionError):
+            return True
+        error_code = current.args[0] if current.args else None
+        if isinstance(error_code, int) and error_code in DATABASE_CONNECTION_ERROR_CODES:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def normalize_language_code(language_code: str) -> str:
@@ -1515,8 +1599,17 @@ def run(args: argparse.Namespace) -> int:
 
     lang_filter = args.lang.split(",") if args.lang else None
     tts = VoiceStudioTtsClient() if args.apply else None
-    connection = connect_database()
-    connection.ping(reconnect=True)
+    connection = None
+    try:
+        connection = connect_database()
+        connection.ping(reconnect=True)
+    except Exception as exc:
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+        raise DatabaseConnectionError(_safe_error_summary(exc)) from exc
     try:
         with connection.cursor() as cursor:
             registry = load_registry(cursor, lang_filter)
@@ -1610,6 +1703,8 @@ def run(args: argparse.Namespace) -> int:
                             generated_voice, language.get("lang_name") or language["lang_code"],
                         )
                     except Exception as exc:  # noqa: BLE001 - 另一个性别及其他语言仍可继续
+                        if _is_database_connection_error(exc):
+                            raise DatabaseConnectionError(_safe_error_summary(exc)) from exc
                         connection.rollback()
                         profile_failures.append((
                             str(language["lang_code"]), voice_field, len(pending_rows), str(exc),
@@ -1761,6 +1856,8 @@ def run(args: argparse.Namespace) -> int:
                             LOG.info("lang=%s spot=%s %s(%s) -> %s",
                                      language["lang_code"], row["spot_id"], column, gender or "woman", path)
                         except Exception as exc:  # noqa: BLE001 - 单条失败不影响后续
+                            if _is_database_connection_error(exc):
+                                raise DatabaseConnectionError(_safe_error_summary(exc)) from exc
                             counters["failed"] += 1
                             failure_samples.append(
                                 f"lang={language['lang_code']} spot={row['spot_id']} {column}: {exc}"
@@ -1781,6 +1878,8 @@ def run(args: argparse.Namespace) -> int:
                             LOG.info("lang=%s spot=%s %s(%s) -> %s",
                                      language["lang_code"], row["spot_id"], column, gender or "woman", path)
                         except Exception as exc:  # noqa: BLE001 - 单条失败不影响后续
+                            if _is_database_connection_error(exc):
+                                raise DatabaseConnectionError(_safe_error_summary(exc)) from exc
                             counters["failed"] += 1
                             failure_samples.append(
                                 f"lang={language['lang_code']} spot={row['spot_id']} {column}: {exc}"
@@ -1857,6 +1956,11 @@ def run(args: argparse.Namespace) -> int:
                 if key in plan_errors:
                     LOG.info("跳过当前稿件生成 lang=%s spot=%s，读音规划失败",
                              language["lang_code"], row["spot_id"])
+                    counters["failed"] += len(group_tasks)
+                    failure_samples.append(
+                        f"lang={language['lang_code']} spot={row['spot_id']} 读音规划失败，影响 "
+                        f"{len(group_tasks)} 条：{_safe_error_summary(plan_errors[key])}"
+                    )
                 else:
                     LOG.info("开始生成 lang=%s spot=%s 对应音频 %d 条",
                              language["lang_code"], row["spot_id"], len(group_tasks))
@@ -1864,6 +1968,17 @@ def run(args: argparse.Namespace) -> int:
             LOG.info("完成：成功 %d 条，失败 %d 条", counters["success"], counters["failed"])
             for sample in failure_samples[:20]:
                 LOG.error("失败明细: %s", sample)
+            if counters["failed"]:
+                failure_details = "\n".join(
+                    f"- {_safe_error_summary(sample)[:500]}" for sample in failure_samples[:8]
+                )
+                omitted = max(0, len(failure_samples) - 8)
+                if omitted:
+                    failure_details += f"\n- 其余 {omitted} 条失败明细见本机日志"
+                send_feishu_alert(
+                    "本轮语音生成部分失败",
+                    f"成功 {counters['success']} 条，失败 {counters['failed']} 条。\n{failure_details}",
+                )
             return 1 if counters["failed"] else 0
     finally:
         connection.close()
@@ -1899,4 +2014,13 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        exit_code = main()
+    except Exception as exc:
+        if _is_database_connection_error(exc):
+            send_feishu_alert("数据库连接失败", _safe_error_summary(exc), include_database_info=True)
+        else:
+            send_feishu_alert("脚本运行异常", _safe_error_summary(exc))
+        LOG.exception("语音生成脚本异常退出")
+        raise SystemExit(1) from exc
+    raise SystemExit(exit_code)
