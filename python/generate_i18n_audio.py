@@ -15,7 +15,10 @@
 用法：
   python python/generate_i18n_audio.py                          # dry-run：输出待生成清单
   python python/generate_i18n_audio.py --lang en --limit 5      # 只看 en 前 5 条
-  python python/generate_i18n_audio.py --lang en --apply        # 真正合成上传写库
+  python python/generate_i18n_audio.py --lang en --gender female --apply
+                                                               # 只生成女声
+  python python/generate_i18n_audio.py --lang en --gender male --apply
+                                                               # 只生成男声
   python python/generate_i18n_audio.py --lang en --apply --skip-asr --fallback-pronunciation-plan-on-429
                                                                # 429 时用词典规则回退并跳过 ASR
   python python/generate_i18n_audio.py --apply --workers 3      # 3 线程并发合成上传
@@ -875,8 +878,15 @@ def table_exists(cursor: Any, table: str) -> bool:
     return int(cursor.fetchone()["cnt"]) > 0
 
 
-def select_pending(cursor: Any, table: str, limit: int) -> list[dict[str, Any]]:
-    """选出 audio_text 非空、audio_url 或 audio_url_man 有缺失的记录。"""
+def select_pending(cursor: Any, table: str, limit: int, gender: str = "both") -> list[dict[str, Any]]:
+    """选出 audio_text 非空且指定性别音频缺失的记录。"""
+    female_missing = "(d.audio_url IS NULL OR TRIM(d.audio_url) = '')"
+    male_missing = "(d.audio_url_man IS NULL OR TRIM(d.audio_url_man) = '')"
+    pending_condition = {
+        "female": female_missing,
+        "male": male_missing,
+        "both": f"({female_missing} OR {male_missing})",
+    }[gender]
     sql = f"""
         SELECT d.landmark_detail_id AS spot_id, d.area_id, d.name,
                d.audio_url, d.audio_url_man, d.audio_text
@@ -885,8 +895,7 @@ def select_pending(cursor: Any, table: str, limit: int) -> list[dict[str, Any]]:
         WHERE ifnull(s.is_deleted, 0) = 0
           AND d.audio_text IS NOT NULL
           AND TRIM(d.audio_text) <> ''
-          AND (d.audio_url IS NULL OR TRIM(d.audio_url) = ''
-               OR d.audio_url_man IS NULL OR TRIM(d.audio_url_man) = '')
+          AND {pending_condition}
         ORDER BY d.landmark_detail_id
     """
     params: tuple[Any, ...] = ()
@@ -1310,10 +1319,12 @@ class VoiceStudioTtsClient:
             except urllib.error.HTTPError as exc:
                 detail = self._error_detail(exc)
                 error_headers = exc.headers or {}
-                retryable = exc.code in (429, 504) or (
-                    exc.code == 503
-                    and error_headers.get("X-OmniVoice-Retryable", "").strip().lower() == "true"
+                retry_after = error_headers.get("Retry-After", "").strip()
+                retryable_header = any(
+                    error_headers.get(header, "").strip().lower() == "true"
+                    for header in ("X-VoiceStudio-Retryable", "X-OmniVoice-Retryable")
                 )
+                retryable = (exc.code == 429 and bool(retry_after)) or retryable_header
                 if not retryable or attempt == MAX_RETRY_PER_CHUNK:
                     raise RuntimeError(
                         f"VoiceStudio TTS request failed: HTTP {exc.code} {detail}"
@@ -1326,17 +1337,10 @@ class VoiceStudioTtsClient:
                 time.sleep(delay)
                 continue
             except OSError as exc:
-                if attempt == MAX_RETRY_PER_CHUNK:
-                    raise RuntimeError(
-                        f"VoiceStudio TTS request failed after {MAX_RETRY_PER_CHUNK} attempts: {exc}"
-                    ) from exc
-                delay = min(30.0, RETRY_INTERVAL_SECONDS * (2 ** (attempt - 1)))
-                LOG.warning(
-                    "VoiceStudio TTS connection failed, retrying in %.1fs (attempt %s/%s): %s",
-                    delay, attempt, MAX_RETRY_PER_CHUNK, exc,
-                )
-                time.sleep(delay)
-                continue
+                raise RuntimeError(
+                    "VoiceStudio TTS connection failed; not retrying because the remote "
+                    f"request may still be processing: {exc}"
+                ) from exc
 
             if not audio_bytes:
                 raise ValueError("VoiceStudio returned empty audio data")
@@ -1619,21 +1623,30 @@ def run(args: argparse.Namespace) -> int:
                     print("PENDING_AUDIO_COUNT=0")
                 return 0
             plan: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
+            all_voice_targets = (
+                ("voice", "audio_url", "female"),
+                ("man_voice", "audio_url_man", "male"),
+            )
+            voice_targets = tuple(
+                target for target in all_voice_targets
+                if args.gender == "both" or target[2] == args.gender
+            )
             for language in registry:
                 suffix = str(language["table_suffix"] or "")
                 table = f"pt_landmark_detail{suffix}"
                 if not table_exists(cursor, table):
                     LOG.warning("表 %s 不存在，跳过语言 %s", table, language["lang_code"])
                     continue
-                rows = select_pending(cursor, table, args.limit)
+                rows = select_pending(cursor, table, args.limit, args.gender)
                 plan.append((language, rows))
 
             total_generate = sum(
                 1
                 for _, rows in plan
                 for row in rows
-                if (needs_generation(row, "audio_url") and str(row.get("area_id") or "").strip())
-                or (needs_generation(row, "audio_url_man") and str(row.get("area_id") or "").strip())
+                for _, audio_field, _ in voice_targets
+                if needs_generation(row, audio_field)
+                and str(row.get("area_id") or "").strip()
             )
             LOG.info(
                 "待处理语言 %d 个，待生成语音 %d 条（dry-run 只列清单，--apply 才执行）",
@@ -1643,10 +1656,14 @@ def run(args: argparse.Namespace) -> int:
                 print(f"PENDING_AUDIO_COUNT={total_generate}")
                 return 0
             for language, rows in plan:
+                pending_rows = sum(
+                    1 for row in rows
+                    if any(needs_generation(row, audio_field) for _, audio_field, _ in voice_targets)
+                )
                 LOG.info(
                     "语言 %s（%s%s）女声音色=%s 男声音色=%s，待补 %d 条",
                     language["lang_code"], "pt_landmark_detail", language["table_suffix"],
-                    language["voice"] or "(未配置)", language["man_voice"] or "(未配置)", len(rows),
+                    language["voice"] or "(未配置)", language["man_voice"] or "(未配置)", pending_rows,
                 )
             if not args.apply:
                 for language, rows in plan:
@@ -1654,8 +1671,8 @@ def run(args: argparse.Namespace) -> int:
                         LOG.info(
                             "[dry-run] lang=%s spot=%s area=%s name=%s woman=%s man=%s",
                             language["lang_code"], row["spot_id"], row["area_id"],
-                            row["name"], needs_generation(row, "audio_url"),
-                            needs_generation(row, "audio_url_man"),
+                            row["name"], args.gender != "male" and needs_generation(row, "audio_url"),
+                            args.gender != "female" and needs_generation(row, "audio_url_man"),
                         )
                 return 0
 
@@ -1663,10 +1680,7 @@ def run(args: argparse.Namespace) -> int:
             tasks: list[tuple[dict[str, Any], dict[str, Any], str, str, str | None]] = []
             profile_failures: list[tuple[str, str, int, str]] = []
             for language, rows in plan:
-                for voice_field, audio_field, gender in (
-                    ("voice", "audio_url", "female"),
-                    ("man_voice", "audio_url_man", "male"),
-                ):
+                for voice_field, audio_field, gender in voice_targets:
                     pending_rows = [
                         row for row in rows
                         if needs_generation(row, audio_field)
@@ -1718,18 +1732,20 @@ def run(args: argparse.Namespace) -> int:
                     if not str(row.get("area_id") or "").strip():
                         LOG.warning("lang=%s spot=%s 缺少 area_id，跳过", language["lang_code"], row["spot_id"])
                         continue
-                    if needs_generation(row, "audio_url"):
-                        female_voice = str(language.get("voice") or "").strip()
-                        if female_voice:
-                            tasks.append((language, row, "audio_url", female_voice, None))
+                    for voice_field, audio_field, gender in voice_targets:
+                        if not needs_generation(row, audio_field):
+                            continue
+                        voice_id = str(language.get(voice_field) or "").strip()
+                        gender_hint = None if gender == "female" else "man"
+                        if voice_id:
+                            tasks.append((language, row, audio_field, voice_id, gender_hint))
                         else:
-                            LOG.info("lang=%s spot=%s 女声音色创建失败，跳过女声", language["lang_code"], row["spot_id"])
-                    if needs_generation(row, "audio_url_man"):
-                        male_voice = str(language.get("man_voice") or "").strip()
-                        if male_voice:
-                            tasks.append((language, row, "audio_url_man", male_voice, "man"))
-                        else:
-                            LOG.info("lang=%s spot=%s 男声音色创建失败，跳过男声", language["lang_code"], row["spot_id"])
+                            LOG.info(
+                                "lang=%s spot=%s %s声音色创建失败，跳过%s声",
+                                language["lang_code"], row["spot_id"],
+                                "女" if gender == "female" else "男",
+                                "女" if gender == "female" else "男",
+                            )
 
             task_groups: dict[tuple[str, str], list[tuple[dict[str, Any], dict[str, Any], str, str, str | None]]] = {}
             for task in tasks:
@@ -1992,6 +2008,10 @@ def main() -> int:
         help="只查询可生成音频数量并输出数字，不调用 TTS 或修改数据库",
     )
     parser.add_argument("--lang", help="只处理指定语言，逗号分隔（如 en,ja）；默认全部启用语音的语言")
+    parser.add_argument(
+        "--gender", choices=("both", "female", "male"), default="both",
+        help="只生成女声、男声或两者；默认 both",
+    )
     parser.add_argument("--limit", type=int, default=0, help="每种语言最多处理 N 条，0 表示不限制")
     parser.add_argument("--workers", type=int, default=1, help="合成上传并发线程数，默认 1（串行）")
     parser.add_argument(

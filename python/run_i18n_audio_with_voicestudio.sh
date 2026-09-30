@@ -12,7 +12,7 @@ BACKEND_TARGET="$DOMAIN/$BACKEND_LABEL"
 cd "$PROJECT_DIR"
 
 pending_output="$("$UV_BIN" run --no-project --default-index https://pypi.org/simple \
-  --with pymysql -- python "$SCRIPT_PATH" --check-pending)"
+  --with pymysql -- python "$SCRIPT_PATH" --check-pending --gender female)"
 pending_count="$(printf '%s\n' "$pending_output" \
   | /usr/bin/sed -n 's/^PENDING_AUDIO_COUNT=//p' \
   | /usr/bin/tail -n 1)"
@@ -65,4 +65,4 @@ else
 fi
 
 exec "$UV_BIN" run --no-project --default-index https://pypi.org/simple \
-  --with pymysql -- python "$SCRIPT_PATH" --apply --skip-asr
+  --with pymysql -- python "$SCRIPT_PATH" --apply --skip-asr --gender female
